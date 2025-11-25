@@ -1,13 +1,15 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
+import os
 import time
 import datetime
-import os
+
+import numpy as np
+import pandas as pd
 import pytz
-from streamlit_js_eval import streamlit_js_eval
+import streamlit as st
+from libsql_client import ClientSync, create_client_sync
 from lightweight_charts.widgets import StreamlitChart
-from libsql_client import create_client_sync, ClientSync
+from streamlit_autorefresh import st_autorefresh  # requires: pip install streamlit-autorefresh
+from streamlit_js_eval import streamlit_js_eval
 
 # ========================================
 # PAGE CONFIG
@@ -15,13 +17,14 @@ from libsql_client import create_client_sync, ClientSync
 st.set_page_config(
     layout="wide",
     page_title="Market Rewind",
-    initial_sidebar_state="collapsed"
+    initial_sidebar_state="collapsed",
 )
 
 # ========================================
 # CSS: CLEAN PADDING
 # ========================================
-st.markdown("""
+st.markdown(
+    """
     <style>
         .block-container {
             padding-top: 1rem;
@@ -37,7 +40,9 @@ st.markdown("""
             width: 100%;
         }
     </style>
-""", unsafe_allow_html=True)
+    """,
+    unsafe_allow_html=True,
+)
 
 # ========================================
 # DYNAMIC HEIGHT CALC
@@ -47,9 +52,9 @@ def get_dynamic_chart_height(num_charts, viewport_height):
     Compute per-chart height based on viewport.
     """
     if viewport_height is None or viewport_height <= 0:
-        viewport_height = 900 
+        viewport_height = 900
 
-    reserved_top_px = 40 
+    reserved_top_px = 40
     reserved_bottom_px = 10
 
     usable = max(300, viewport_height - reserved_top_px - reserved_bottom_px)
@@ -58,6 +63,7 @@ def get_dynamic_chart_height(num_charts, viewport_height):
     per_chart = usable / rows
 
     return int(per_chart)
+
 
 # ========================================
 # DATABASE CONNECTION
@@ -83,6 +89,7 @@ def get_db_connection():
         st.error(f"Failed to create Turso client: {e}")
         return None
 
+
 @st.cache_data
 def get_available_tickers(_client: ClientSync):
     try:
@@ -92,32 +99,29 @@ def get_available_tickers(_client: ClientSync):
         st.error(f"Failed to fetch tickers: {e}")
         return []
 
+
 @st.cache_data
 def load_master_data(_client: ClientSync, ticker: str, earliest_date_str: str, include_eth: bool):
     try:
-        # Construct query based on ETH toggle
-        # If ETH is True, we remove the session filter to get ALL sessions (REG + EXT)
-        # If ETH is False, we restrict to 'REG' only
-        
         if include_eth:
             query = """
-                SELECT timestamp, open, high, low, close, volume 
-                FROM market_data 
+                SELECT timestamp, open, high, low, close, volume
+                FROM market_data
                 WHERE symbol = ? AND timestamp >= ?
                 ORDER BY timestamp;
             """
             params = [ticker, earliest_date_str]
         else:
             query = """
-                SELECT timestamp, open, high, low, close, volume 
-                FROM market_data 
+                SELECT timestamp, open, high, low, close, volume
+                FROM market_data
                 WHERE symbol = ? AND session = 'REG' AND timestamp >= ?
                 ORDER BY timestamp;
             """
             params = [ticker, earliest_date_str]
-            
+
         rs = _client.execute(query, params)
-        
+
     except Exception as e:
         st.error(f"DB Query failed for {ticker}: {e}")
         return pd.DataFrame()
@@ -127,200 +131,285 @@ def load_master_data(_client: ClientSync, ticker: str, earliest_date_str: str, i
         return df
 
     # Ensure timezone aware (UTC)
-    df['time'] = pd.to_datetime(df['timestamp'], utc=True)
-    
-    for col in ['open', 'high', 'low', 'close', 'volume']:
+    df["time"] = pd.to_datetime(df["timestamp"], utc=True)
+
+    for col in ["open", "high", "low", "close", "volume"]:
         df[col] = pd.to_numeric(df[col])
-    
+
     # Color logic
-    df['color'] = np.where(df['open'] > df['close'],
-                           'rgba(239, 83, 80, 0.8)',
-                           'rgba(38, 166, 154, 0.8)')
-    
-    return df[['time', 'open', 'high', 'low', 'close', 'volume', 'color']]
+    df["color"] = np.where(
+        df["open"] > df["close"],
+        "rgba(239, 83, 80, 0.8)",
+        "rgba(38, 166, 154, 0.8)",
+    )
+
+    return df[["time", "open", "high", "low", "close", "volume", "color"]]
+
 
 @st.cache_data
 def resample_data(df, timeframe):
     if df.empty:
-        return pd.DataFrame(columns=['time', 'open', 'high', 'low', 'close', 'volume', 'color'])
+        return pd.DataFrame(columns=["time", "open", "high", "low", "close", "volume", "color"])
 
-    df = df.set_index('time')
-    agg = {'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}
+    df = df.set_index("time")
+    agg = {
+        "open": "first",
+        "high": "max",
+        "low": "min",
+        "close": "last",
+        "volume": "sum",
+    }
     resampled = df.resample(timeframe).agg(agg).dropna().reset_index()
-    
+
     # Re-apply color after resampling
-    resampled['color'] = np.where(resampled['open'] > resampled['close'],
-                                  'rgba(239, 83, 80, 0.8)',
-                                  'rgba(38, 166, 154, 0.8)')
+    resampled["color"] = np.where(
+        resampled["open"] > resampled["close"],
+        "rgba(239, 83, 80, 0.8)",
+        "rgba(38, 166, 154, 0.8)",
+    )
     return resampled
 
-# ========================================
-# CHART UNIT
-# ========================================
 
-# --- FIX: @st.fragment DECORATOR ADDED HERE ---
-# This isolates the rerun loop to ONLY this specific chart unit function.
-# The rest of the page (Layout controls, Headers) will NOT reload during playback.
+# ========================================
+# GLOBAL TIMEFRAME MAP & PLAYBACK HELPERS
+# ========================================
+TIMEFRAME_MAP = {
+    "1 Min": ("1min", 1),
+    "5 Min": ("5min", 5),
+    "15 Min": ("15min", 15),
+    "30 Min": ("30min", 30),
+    "1 Hr": ("1H", 60),
+    "1 Day": ("1D", 1440),
+}
+
+
+def init_global_playback_state():
+    if "global_playing" not in st.session_state:
+        st.session_state["global_playing"] = False
+    if "global_speed" not in st.session_state:
+        st.session_state["global_speed"] = 1.0  # seconds
+    if "global_date" not in st.session_state:
+        st.session_state["global_date"] = None
+    if "global_dt" not in st.session_state:
+        st.session_state["global_dt"] = None
+    if "global_date_prev" not in st.session_state:
+        st.session_state["global_date_prev"] = None
+    if "global_last_tick" not in st.session_state:
+        st.session_state["global_last_tick"] = None
+
+
+def get_min_step_minutes(num_charts: int) -> int:
+    mins = []
+    for i in range(num_charts):
+        tf_label = st.session_state.get(f"c{i}_tf", "1 Min")
+        _, step_min = TIMEFRAME_MAP.get(tf_label, ("1min", 1))
+        mins.append(step_min)
+    return min(mins) if mins else 1
+
+
+def ensure_global_dt_initialized():
+    """Ensure global_dt exists, using global_date at 9:30 AM ET."""
+    if st.session_state.get("global_date") is None:
+        return
+    if st.session_state.get("global_dt") is None:
+        ny_tz = pytz.timezone("America/New_York")
+        start_dt_ny = datetime.datetime.combine(
+            st.session_state["global_date"],
+            datetime.time(9, 30),
+        )
+        st.session_state["global_dt"] = ny_tz.localize(start_dt_ny).astimezone(pytz.UTC)
+
+
+def step_global_dt(direction: int = 1):
+    """Move global_dt by +/- one smallest timeframe unit."""
+    ensure_global_dt_initialized()
+    if st.session_state.get("global_dt") is None:
+        return
+    n = st.session_state.get("num_charts", 1)
+    minutes = get_min_step_minutes(n)
+    delta = datetime.timedelta(minutes=minutes * direction)
+    st.session_state["global_dt"] = st.session_state["global_dt"] + delta
+
+
+def render_global_controls():
+    init_global_playback_state()
+    ensure_global_dt_initialized()
+
+    c_date, c_prev, c_play, c_next, c_speed = st.columns([2, 0.7, 1.5, 0.7, 1.5])
+
+    # Global Date picker: reset global_dt to 9:30 AM ET on new date
+    with c_date:
+        date_val = st.date_input(
+            "Date",
+            key="global_date",
+            help="Trading date for Market Rewind (resets time to 9:30 AM ET when changed).",
+        )
+        if st.session_state["global_date_prev"] != date_val:
+            st.session_state["global_date_prev"] = date_val
+            st.session_state["global_date"] = date_val
+            ny_tz = pytz.timezone("America/New_York")
+            start_dt_ny = datetime.datetime.combine(
+                date_val,
+                datetime.time(9, 30),
+            )
+            st.session_state["global_dt"] = ny_tz.localize(start_dt_ny).astimezone(pytz.UTC)
+            st.session_state["global_playing"] = False
+            st.rerun()
+
+    # Previous: step back by one unit
+    with c_prev:
+        if st.button("⏮", use_container_width=True, help="Step Back (Previous Unit)"):
+            step_global_dt(direction=-1)
+            st.rerun()
+
+    # Play / Pause toggle
+    with c_play:
+        if st.session_state.get("global_playing", False):
+            if st.button("⏸ Pause", use_container_width=True):
+                st.session_state["global_playing"] = False
+                st.rerun()
+        else:
+            if st.button("▶ Play", use_container_width=True):
+                st.session_state["global_playing"] = True
+                st.rerun()
+
+    # Next: step forward by one unit
+    with c_next:
+        if st.button("⏭", use_container_width=True, help="Step Forward (Next Unit)"):
+            step_global_dt(direction=1)
+            st.rerun()
+
+    # Global speed selector
+    with c_speed:
+        speed_options = [0.1, 0.25, 0.5, 1.0, 2.0, 5.0]
+        current_speed = st.session_state.get("global_speed", 1.0)
+        if current_speed not in speed_options:
+            current_speed = 1.0
+        st.session_state["global_speed"] = st.selectbox(
+            "Spd",
+            speed_options,
+            index=speed_options.index(current_speed),
+            format_func=lambda x: f"{x:.2f}s" if x < 1 else f"{x:.0f}s",
+            key="global_speed_widget",
+            label_visibility="collapsed",
+            help="Time delay between each global step (lower is faster).",
+        )
+
+    # Display current global time in NY
+    if st.session_state.get("global_dt") is not None:
+        ny_tz = pytz.timezone("America/New_York")
+        ts_ny = st.session_state["global_dt"].astimezone(ny_tz)
+        st.caption(f"Global replay time: {ts_ny.strftime('%Y-%m-%d %H:%M %Z')}")
+
+
+# ========================================
+# CHART UNIT (PURE VIEW OF GLOBAL_DT)
+# ========================================
 @st.fragment
 def render_chart_unit(chart_id, db_client, show_border=True, default_tf="1 Min"):
     """
-    Renders a completely independent chart unit with automatic replay loading.
+    Renders a chart unit that is fully driven by global_dt.
+    No local playback loop or local time state.
     """
     # STATE KEYS
     k_ticker = f"c{chart_id}_ticker"
     k_tf = f"c{chart_id}_tf"
-    k_eth = f"c{chart_id}_eth" 
-    k_view_mode = f"c{chart_id}_view_mode" 
+    k_eth = f"c{chart_id}_eth"
+    k_view_mode = f"c{chart_id}_view_mode"
     k_active = f"c{chart_id}_active"
-    k_paused = f"c{chart_id}_paused"
-    k_index = f"c{chart_id}_index"
     k_data = f"c{chart_id}_data"
-    k_date = f"c{chart_id}_date"
-    k_speed = f"c{chart_id}_speed"
-    k_last_sig = f"c{chart_id}_last_signature" 
-    k_prev_date = f"c{chart_id}_prev_date" # Fixed: Added missing definition for date tracking key
+    k_last_sig = f"c{chart_id}_last_signature"
 
-    # Initialize State
+    # Initialize per-chart state
     if k_active not in st.session_state:
-        st.session_state[k_active] = True 
-        st.session_state[k_paused] = True
-        st.session_state[k_index] = 0
-        st.session_state[k_data] = pd.DataFrame()
-    
-    if k_last_sig not in st.session_state:
-        st.session_state[k_last_sig] = None
-
-    if k_prev_date not in st.session_state:
-        st.session_state[k_prev_date] = None
-
+        st.session_state[k_active] = True
     if k_tf not in st.session_state:
         st.session_state[k_tf] = default_tf
-        
     if k_eth not in st.session_state:
-        st.session_state[k_eth] = False 
-
-    # New State for View Mode (Selector)
+        st.session_state[k_eth] = False
     if k_view_mode not in st.session_state:
         st.session_state[k_view_mode] = "Viewer Mode"
+    if k_data not in st.session_state:
+        st.session_state[k_data] = pd.DataFrame()
+    if k_last_sig not in st.session_state:
+        st.session_state[k_last_sig] = None
 
     chart_height = st.session_state.get("chart_height_px", 600)
 
     with st.container(border=show_border):
-
         # --- CONTROLS ROW 1: SELECTORS ---
         c1, c2, c3, c4, _ = st.columns([1.5, 1.5, 2.0, 1.0, 1.0])
-        
+
         with c1:
             tickers = get_available_tickers(db_client)
             sel_ticker = st.selectbox(
-                "Ticker", tickers,
+                "Ticker",
+                tickers,
                 key=k_ticker,
                 label_visibility="collapsed",
                 placeholder="Ticker",
-                help="Select the stock symbol to analyze."
+                help="Select the stock symbol to analyze.",
             )
+
         with c2:
-            tf_map = {"1 Min": "1min", "5 Min": "5min", "15 Min": "15min", "30 Min": "30min", "1 Hr": "1H", "1 Day": "1D"}
-            sel_tf_str = st.selectbox(
-                "TF", list(tf_map.keys()), 
-                key=k_tf, 
+            tf_label = st.selectbox(
+                "TF",
+                list(TIMEFRAME_MAP.keys()),
+                key=k_tf,
                 label_visibility="collapsed",
-                help="Select the chart timeframe."
+                help="Select the chart timeframe.",
             )
-            sel_tf_agg = tf_map[sel_tf_str]
-            
+            sel_tf_agg, _ = TIMEFRAME_MAP[tf_label]
+
         with c3:
-            # View Mode Selector (Replaces Toggle)
             st.selectbox(
-                "Mode", 
-                ["Viewer Mode", "Replay Mode"], 
-                key=k_view_mode, 
+                "Mode",
+                ["Viewer Mode", "Replay Mode"],
+                key=k_view_mode,
                 label_visibility="collapsed",
-                help="Viewer Mode: Dense, thin candles for overview.\nReplay Mode: Zoomed, thick candles for simulation."
+                help=(
+                    "Viewer Mode: Dense, thin candles for overview.\n"
+                    "Replay Mode: Zoomed, thick candles for simulation."
+                ),
             )
 
         with c4:
-            # ETH Toggle Button (Moved to end)
             is_eth = st.toggle(
-                "ETH", 
+                "ETH",
                 key=k_eth,
-                help="Toggle Extended Trading Hours (Pre/Post Market).\n\n⚠️ **WARNING:** Toggling this will reset the chart and lost replay progress!"
+                help=(
+                    "Toggle Extended Trading Hours (Pre/Post Market).\n\n"
+                    "⚠️ Toggling this will reload data for this chart."
+                ),
             )
 
-        # Logic check for mode
-        is_replay_mode = (st.session_state[k_view_mode] == "Replay Mode")
+        is_replay_mode = st.session_state[k_view_mode] == "Replay Mode"
 
-        # --- DATA PREP (AUTO-LOAD LOGIC) ---
+        # --- DATA PREP ---
         if not sel_ticker:
             st.info("Select ticker")
             return
 
         EARLIEST = "2024-01-01"
         master_data = load_master_data(db_client, sel_ticker, EARLIEST, is_eth)
-        
         if master_data.empty:
             st.warning("No data found.")
             return
-        
-        # --- SMART DATE LOGIC ---
-        # 1. Find latest available date in the DB for this ticker (for initial default only)
-        latest_db_date = master_data['time'].max().date()
-        
-        # 2. Only set the date to the latest DB date if it hasn't been set yet.
-        #    Once set, we DO NOT overwrite it when the ticker changes.
-        if k_date not in st.session_state:
-            st.session_state[k_date] = latest_db_date
 
-        current_date_val = st.session_state[k_date]
-        # ------------------------
+        # Initialize global_date / global_dt once using actual data
+        latest_db_date = master_data["time"].max().date()
+        if st.session_state.get("global_date") is None:
+            st.session_state["global_date"] = latest_db_date
+        ensure_global_dt_initialized()
 
-        current_signature = f"{sel_ticker}_{sel_tf_agg}_{current_date_val}_{is_eth}"
-        
+        # (Re)build resampled data only when signature changes
+        current_signature = f"{sel_ticker}_{sel_tf_agg}_{is_eth}"
         if st.session_state[k_last_sig] != current_signature:
-            # === RECALCULATE STATE ===
-            
-            # A. Resample Full History
             full_resampled = resample_data(master_data, sel_tf_agg)
-            
-            # B. Calculate Start Index
-            if not full_resampled.empty:
-                # Determine the target time to sync to
-                
-                # Default target: 9:30 AM ET on the selected date
-                ny_tz = pytz.timezone('America/New_York')
-                start_dt_ny = datetime.datetime.combine(current_date_val, datetime.time(9, 30))
-                target_dt_aware = ny_tz.localize(start_dt_ny).astimezone(pytz.UTC)
-
-                # SYNC LOGIC: If date hasn't changed (meaning Ticker/TF changed), try to keep current replay time
-                prev_date_val = st.session_state.get(k_prev_date)
-                
-                # Check if we have existing data to grab time from
-                if prev_date_val == current_date_val and not st.session_state[k_data].empty:
-                    try:
-                        # Get current replay time from old data before we overwrite it
-                        curr_idx = min(st.session_state[k_index], len(st.session_state[k_data]) - 1)
-                        current_replay_time = st.session_state[k_data].iloc[curr_idx]['time']
-                        # Update target to current replay time
-                        target_dt_aware = current_replay_time
-                    except Exception:
-                        pass # Fallback to 9:30 AM if error
-
-                # Find index for target time in NEW data
-                start_index = full_resampled['time'].searchsorted(target_dt_aware)
-                start_index = min(max(0, start_index), len(full_resampled) - 1)
-                
-                # Update State with new data and synced index
-                st.session_state[k_data] = full_resampled
-                st.session_state[k_index] = int(start_index)
-            else:
-                 st.session_state[k_data] = pd.DataFrame()
-                 st.session_state[k_index] = 0
-            
-            st.session_state[k_paused] = True
-            st.session_state[k_active] = True 
+            st.session_state[k_data] = full_resampled
             st.session_state[k_last_sig] = current_signature
-            st.session_state[k_prev_date] = current_date_val
 
+        df = st.session_state[k_data]
 
         # --- CHART RENDERING ---
         try:
@@ -329,28 +418,39 @@ def render_chart_unit(chart_id, db_client, show_border=True, default_tf="1 Min")
             chart.price_scale()
             chart.volume_config()
 
-            # --- DYNAMIC VISUAL SETTINGS ---
+            # DYNAMIC VISUAL SETTINGS
             if is_replay_mode:
-                # REPLAY MODE: Very thick bars, Wide offset
-                offset = 45 # Increased for more y-axis distance
-                
-                if sel_tf_str == "1 Min": spacing = 8.0 # Thicker 1-min
-                elif sel_tf_str == "5 Min": spacing = 10.0
-                elif sel_tf_str == "15 Min": spacing = 12.0
-                elif sel_tf_str == "30 Min": spacing = 14.0
-                elif sel_tf_str == "1 Hr": spacing = 16.0
-                elif sel_tf_str == "1 Day": spacing = 20.0
-                else: spacing = 10.0
+                offset = 45
+                if tf_label == "1 Min":
+                    spacing = 8.0
+                elif tf_label == "5 Min":
+                    spacing = 10.0
+                elif tf_label == "15 Min":
+                    spacing = 12.0
+                elif tf_label == "30 Min":
+                    spacing = 14.0
+                elif tf_label == "1 Hr":
+                    spacing = 16.0
+                elif tf_label == "1 Day":
+                    spacing = 20.0
+                else:
+                    spacing = 10.0
             else:
-                # VIEWER MODE: Thin bars, Tight offset (Overview)
                 offset = 5
-                if sel_tf_str == "1 Min": spacing = 0.5
-                elif sel_tf_str == "5 Min": spacing = 2.0
-                elif sel_tf_str == "15 Min": spacing = 4.0
-                elif sel_tf_str == "30 Min": spacing = 7.0
-                elif sel_tf_str == "1 Hr": spacing = 8.0
-                elif sel_tf_str == "1 Day": spacing = 10.0
-                else: spacing = 5.0
+                if tf_label == "1 Min":
+                    spacing = 0.5
+                elif tf_label == "5 Min":
+                    spacing = 2.0
+                elif tf_label == "15 Min":
+                    spacing = 4.0
+                elif tf_label == "30 Min":
+                    spacing = 7.0
+                elif tf_label == "1 Hr":
+                    spacing = 8.0
+                elif tf_label == "1 Day":
+                    spacing = 10.0
+                else:
+                    spacing = 5.0
 
             chart.time_scale(min_bar_spacing=spacing, right_offset=offset)
 
@@ -358,99 +458,43 @@ def render_chart_unit(chart_id, db_client, show_border=True, default_tf="1 Min")
             st.error(f"Chart Error: {e}")
             return
 
-        if not st.session_state[k_data].empty:
-            current_slice = st.session_state[k_data].iloc[:st.session_state[k_index]]
-            if not current_slice.empty:
-                c_data = current_slice.copy()
-                c_data['time'] = c_data['time'].apply(lambda x: x.isoformat())
-                chart.set(c_data)
-            else:
-                 chart.set(pd.DataFrame(columns=['time', 'open', 'high', 'low', 'close', 'volume', 'color']))
-            
-            # Helper: Replay Progress Text (helps verify speed)
-            if is_replay_mode:
-                try:
-                    last_time = current_slice['time'].iloc[-1]
-                    # Format timestamp nicely
-                    ts_str = last_time.strftime('%H:%M')
-                except:
-                    ts_str = "--:--"
-                st.caption(f"Replay: {ts_str} ({st.session_state[k_index]}/{len(st.session_state[k_data])})")
-
+        # --- APPLY GLOBAL TIME TO THIS CHART ---
+        if (
+            not df.empty
+            and st.session_state.get("global_dt") is not None
+        ):
+            global_dt = st.session_state["global_dt"]
+            # include all candles <= global_dt
+            idx = df["time"].searchsorted(global_dt, side="right")
+            idx = min(max(0, idx), len(df))
+            current_slice = df.iloc[:idx].copy()
         else:
-            chart.set(pd.DataFrame(columns=['time', 'open', 'high', 'low', 'close', 'volume', 'color']))
+            current_slice = pd.DataFrame(columns=df.columns) if not df.empty else df
+
+        if not current_slice.empty:
+            current_slice["time"] = current_slice["time"].apply(lambda x: x.isoformat())
+            chart.set(current_slice)
+            if is_replay_mode:
+                # current_slice["time"] is ISO strings now; parse for display
+                try:
+                    last_time_dt = pd.to_datetime(current_slice["time"].iloc[-1])
+                    ts_str = last_time_dt.strftime("%H:%M")
+                except Exception:
+                    ts_str = "--:--"
+                st.caption(f"Replay: {ts_str} ({len(current_slice)}/{len(df)})")
+        else:
+            chart.set(
+                pd.DataFrame(
+                    columns=["time", "open", "high", "low", "close", "volume", "color"],
+                )
+            )
 
         chart.load()
 
-        # --- BOTTOM CONTROLS ---
-        # Revised Column Distribution for New Buttons
-        # Date | Prev | Play | Next | Reset | Speed
-        c_date, c_prev, c_play, c_next, c_reset, c_speed = st.columns([2, 0.7, 1.5, 0.7, 1.5, 1.5])
-
-        with c_date:
-            st.date_input(
-                "Start", 
-                # Removed value argument to fix Streamlit error
-                key=k_date, 
-                label_visibility="collapsed",
-                help="Select the starting date for the replay."
-            )
-        
-        with c_prev:
-            if st.button("⏮", key=f"btn_prev_{chart_id}", use_container_width=True, help="Step Back (Previous Candle)"):
-                if st.session_state[k_index] > 0:
-                    st.session_state[k_index] -= 1
-                    st.rerun()
-
-        with c_play:
-            if st.session_state[k_paused]:
-                if st.button("▶ Play", key=f"btn_play_{chart_id}", use_container_width=True):
-                    st.session_state[k_paused] = False
-                    st.rerun()
-            else:
-                if st.button("⏸ Pause", key=f"btn_pause_{chart_id}", use_container_width=True):
-                    st.session_state[k_paused] = True
-                    st.rerun()
-        
-        with c_next:
-            if st.button("⏭", key=f"btn_next_{chart_id}", use_container_width=True, help="Step Forward (Next Candle)"):
-                if st.session_state[k_index] < len(st.session_state[k_data]):
-                    st.session_state[k_index] += 1
-                    st.rerun()
-
-        with c_reset:
-            if st.button("↺ Reset", key=f"btn_reset_{chart_id}", use_container_width=True):
-                st.session_state[k_last_sig] = None 
-                st.rerun()
-
-        with c_speed:
-            # Sort speed options for better UX
-            speed_options = [0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0]
-            r_speed = st.selectbox(
-                "Spd", 
-                speed_options,
-                index=3, # Default to 1.0s
-                format_func=lambda x: f"{x}s",
-                key=k_speed,
-                label_visibility="collapsed",
-                help="Time delay between each candle update (lower is faster)."
-            )
-
-        # --- PLAY LOOP ---
-        if not st.session_state[k_paused]:
-            if st.session_state[k_index] < len(st.session_state[k_data]):
-                st.session_state[k_index] += 1
-                # Explicit sleep with float conversion for safety
-                time.sleep(float(r_speed))
-                st.rerun()
-            else:
-                st.session_state[k_paused] = True
-                st.rerun()
 
 # ========================================
 # MAIN EXECUTION FLOW
 # ========================================
-
 db_client = get_db_connection()
 if not db_client:
     st.stop()
@@ -471,7 +515,10 @@ if "layout_set" not in st.session_state:
 else:
     n = st.session_state.num_charts
 
-    # ===== GLOBAL CHART CONTROLS =====
+    # Initialize global playback state now that n is known
+    init_global_playback_state()
+
+    # ===== GLOBAL CHART CONTROLS (LAYOUT / HEIGHT) =====
     with st.expander("Global chart controls", expanded=False):
         screen_height = streamlit_js_eval(
             js_code="window.innerHeight",
@@ -510,26 +557,54 @@ else:
     viewport_height = manual_height or screen_height
     st.session_state["chart_height_px"] = get_dynamic_chart_height(n, viewport_height)
 
+    # ===== NON-BLOCKING GLOBAL PLAYBACK TIMER =====
+    if st.session_state.get("global_playing", False):
+        interval_ms = int(st.session_state.get("global_speed", 1.0) * 1000)
+        tick = st_autorefresh(
+            interval=interval_ms,
+            limit=None,
+            key="global_playback_tick",
+            debounce=True,
+        )
+        last_tick = st.session_state.get("global_last_tick")
+        if last_tick is None:
+            st.session_state["global_last_tick"] = tick
+        elif tick != last_tick:
+            st.session_state["global_last_tick"] = tick
+            step_global_dt(direction=1)
+
     # ====== RENDER GRID ======
     if n == 1:
         render_chart_unit(0, db_client, show_border=False)
 
     elif n == 2:
         c1, c2 = st.columns(2)
-        with c1: render_chart_unit(0, db_client)
-        with c2: render_chart_unit(1, db_client)
+        with c1:
+            render_chart_unit(0, db_client)
+        with c2:
+            render_chart_unit(1, db_client)
 
     elif n == 3:
         c1, c2 = st.columns(2)
-        with c1: render_chart_unit(0, db_client)
-        with c2: render_chart_unit(1, db_client)
+        with c1:
+            render_chart_unit(0, db_client)
+        with c2:
+            render_chart_unit(1, db_client)
         render_chart_unit(2, db_client)
 
     elif n == 4:
         c1, c2 = st.columns(2)
-        with c1: render_chart_unit(0, db_client)
-        with c2: render_chart_unit(1, db_client)
+        with c1:
+            render_chart_unit(0, db_client)
+        with c2:
+            render_chart_unit(1, db_client)
 
         c3, c4 = st.columns(2)
-        with c3: render_chart_unit(2, db_client)
-        with c4: render_chart_unit(3, db_client)
+        with c3:
+            render_chart_unit(2, db_client)
+        with c4:
+            render_chart_unit(3, db_client)
+
+    # ===== GLOBAL CONTROL BAR (BOTTOM) =====
+    st.markdown("---")
+    render_global_controls()
