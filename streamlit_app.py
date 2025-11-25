@@ -157,6 +157,11 @@ def resample_data(df, timeframe):
 # ========================================
 # CHART UNIT
 # ========================================
+
+# --- FIX: @st.fragment DECORATOR ADDED HERE ---
+# This isolates the rerun loop to ONLY this specific chart unit function.
+# The rest of the page (Layout controls, Headers) will NOT reload during playback.
+@st.fragment
 def render_chart_unit(chart_id, db_client, show_border=True, default_tf="1 Min"):
     """
     Renders a completely independent chart unit with automatic replay loading.
@@ -173,7 +178,7 @@ def render_chart_unit(chart_id, db_client, show_border=True, default_tf="1 Min")
     k_date = f"c{chart_id}_date"
     k_speed = f"c{chart_id}_speed"
     k_last_sig = f"c{chart_id}_last_signature" 
-    k_prev_date = f"c{chart_id}_prev_date" # NEW: To track date changes for sync logic
+    k_prev_date = f"c{chart_id}_prev_date" # Fixed: Added missing definition for date tracking key
 
     # Initialize State
     if k_active not in st.session_state:
@@ -184,7 +189,7 @@ def render_chart_unit(chart_id, db_client, show_border=True, default_tf="1 Min")
     
     if k_last_sig not in st.session_state:
         st.session_state[k_last_sig] = None
-        
+
     if k_prev_date not in st.session_state:
         st.session_state[k_prev_date] = None
 
@@ -258,9 +263,11 @@ def render_chart_unit(chart_id, db_client, show_border=True, default_tf="1 Min")
             return
         
         # --- SMART DATE LOGIC ---
+        # 1. Find latest available date in the DB for this ticker (for initial default only)
         latest_db_date = master_data['time'].max().date()
         
-        # Only set date initially. Do not overwrite on ticker change.
+        # 2. Only set the date to the latest DB date if it hasn't been set yet.
+        #    Once set, we DO NOT overwrite it when the ticker changes.
         if k_date not in st.session_state:
             st.session_state[k_date] = latest_db_date
 
