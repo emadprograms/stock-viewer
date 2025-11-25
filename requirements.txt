@@ -4,4 +4,3 @@ numpy
 lightweight-charts
 libsql-client
 streamlit-js-eval
-streamlit-autorefresh
